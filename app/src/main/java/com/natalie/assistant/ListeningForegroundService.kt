@@ -18,6 +18,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -235,6 +236,106 @@ class ListeningForegroundService : Service() {
 
     /** Consecutive recognizer restarts inside one conversation window. */
     private var conversationRestarts = 0
+
+    // ------------------------------------------------------------------
+    // V1: RealtimeConversationController — turn ownership via generation.
+    //
+    // Every user turn gets a monotonically increasing generation. Only a
+    // genuinely new turn advances it: wake from WAKE_IDLE, follow-up
+    // captured in the conversation window, explicit Stop, session reset.
+    // Duplicate wake_requested events, WS reconnects, recognition retries,
+    // and polling retries NEVER advance it.
+    //
+    // Every async callback captures (generation, messageId) when its work
+    // starts and validates before acting: a stale callback may not start
+    // playback, stop a newer player, overwrite state, or reopen listening.
+    // ------------------------------------------------------------------
+
+    /** One user turn, from wake/follow-up through reply playback. */
+    private data class Turn(
+        val turnId: String,
+        val generation: Long,
+        var messageId: String?,
+        val startedAtElapsed: Long,
+        var hintSentAtElapsed: Long = 0L,
+        var messageSentAtElapsed: Long = 0L,
+        var claimedAtElapsed: Long = 0L,
+        var repliedAtElapsed: Long = 0L,
+        var audioReadyAtElapsed: Long = 0L,
+        var playbackStartedAtElapsed: Long = 0L
+    ) {
+        fun latencySummary(): String {
+            fun s(a: Long, b: Long) = if (a > 0 && b > 0) "${(b - a) / 1000.0}s" else "—"
+            return "gen=$generation " +
+                "hint→send=${s(hintSentAtElapsed, messageSentAtElapsed)} " +
+                "send→claim=${s(messageSentAtElapsed, claimedAtElapsed)} " +
+                "claim→reply=${s(claimedAtElapsed, repliedAtElapsed)} " +
+                "reply→audio=${s(repliedAtElapsed, audioReadyAtElapsed)} " +
+                "audio→play=${s(audioReadyAtElapsed, playbackStartedAtElapsed)}"
+        }
+    }
+
+    /** Monotonic generation — the single authority on "which turn is current". */
+    private var conversationGeneration = 0L
+
+    /** The turn currently owning the mic/player/UI (null when idle/stopped). */
+    private var activeTurn: Turn? = null
+
+    /**
+     * V1: monotonic deadline for the follow-up window, independent of
+     * VoiceState. onEndOfSpeech() may flip the state to TRANSCRIBING, but
+     * the window stays open until THIS deadline passes. onError() retries
+     * recoverable errors against this deadline, not the state label.
+     */
+    private var conversationDeadlineElapsed = 0L
+
+    /** messageId → generation that sent it (for WS/poll-delivered replies). */
+    private val messageGenerations = mutableMapOf<String, Long>()
+
+    /** V1: count duplicate wake_requested WS events per message (log only). */
+    private val wakeRequestedCounts = mutableMapOf<String, Int>()
+
+    @Synchronized
+    private fun rememberMessageGeneration(id: String, gen: Long) {
+        messageGenerations[id] = gen
+        if (messageGenerations.size > 100) {
+            messageGenerations.remove(messageGenerations.keys.first())
+        }
+    }
+
+    @Synchronized
+    private fun generationForMessage(id: String): Long? = messageGenerations[id]
+
+    /** True while the follow-up window is open, regardless of VoiceState. */
+    private fun isFollowUpWindowOpen(): Boolean =
+        conversationDeadlineElapsed > 0L &&
+            SystemClock.elapsedRealtime() < conversationDeadlineElapsed
+
+    /**
+     * V1: cancel everything the current turn owns, immediately.
+     * Stops/releases the player, cancels queued audio fetch, timers, and
+     * marks the turn dead so in-flight callbacks fail their generation
+     * check. Does NOT advance the generation — the caller does that when
+     * starting the replacement turn (or on Stop).
+     */
+    private fun cancelActiveTurn(reason: String) {
+        val turn = activeTurn
+        logEvent("TURN CANCEL — reason=$reason gen=${turn?.generation ?: "none"}")
+        // 1. Revoke playback eligibility NOW — never wait for callbacks.
+        releasePlayer()
+        audioStatus = ""
+        // 2. Cancel any queued audio fetch.
+        audioWaitMessageId = null
+        synchronized(audioSignal) { audioSignal.notifyAll() }
+        // 3. Cancel timers and close the follow-up window.
+        cancelFailsafe()
+        cancelConversationTimer()
+        conversationDeadlineElapsed = 0L
+        conversationEndsAtMs = 0L
+        activeTurn = null
+        // Background poll threads check their captured generation each
+        // iteration and exit on mismatch — no separate interrupt needed.
+    }
 
     // ------------------------------------------------------------------
     // M2.6: early wake hint — tell the relay the moment "Hi Natalie" is
@@ -486,6 +587,11 @@ class ListeningForegroundService : Service() {
     private fun stopListening() {
         logEvent("Stop requested — releasing microphone")
         running = false
+        // V1: explicit Stop is a session reset — cancel the turn and advance
+        // the generation so every in-flight callback fails its ownership
+        // check. Nothing stale may speak, poll, or reopen listening after.
+        cancelActiveTurn("stop")
+        conversationGeneration++
         cancelFailsafe()
         cancelConversationTimer()
         // An explicit Stop also ends hands-free mode — the user is done.
@@ -600,6 +706,19 @@ class ListeningForegroundService : Service() {
                 "(state=${currentState.get()})")
             return
         }
+        // V1: a genuinely new user turn supersedes everything. Cancel the
+        // old turn's resources first, then advance the generation so any
+        // in-flight callbacks from the old turn fail their ownership check.
+        cancelActiveTurn("new-wake-turn")
+        conversationGeneration++
+        val turnId = java.util.UUID.randomUUID().toString()
+        activeTurn = Turn(
+            turnId = turnId,
+            generation = conversationGeneration,
+            messageId = null,
+            startedAtElapsed = SystemClock.elapsedRealtime()
+        )
+        logEvent("TURN START gen=$conversationGeneration id=${turnId.take(8)}")
         wakeCount++
         val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         setState(VoiceState.WAKE_DETECTED)
@@ -621,6 +740,7 @@ class ListeningForegroundService : Service() {
                 lastWakeHintAt.set(nowMs)
                 val result = RelayClient.sendWakeHint()
                 if (result.ok) {
+                    activeTurn?.hintSentAtElapsed = SystemClock.elapsedRealtime()
                     logEvent("WAKE_HINT SENT — server warmup triggered " +
                         "(http=${result.httpCode})")
                 } else {
@@ -760,34 +880,50 @@ class ListeningForegroundService : Service() {
             cancelFailsafe()
             val reason = sttErrorName(error)
             logEvent("STT ERROR: $reason (code=$error)")
-            // M2.5: inside the conversation window, "heard nothing" style
-            // errors (speech timeout, no match) just mean the window stays
-            // open — cycle the recognizer unless the window already expired.
-            if (currentState.get() == VoiceState.CONVERSATION_PAUSE) {
+            // V1: the follow-up window is tracked by monotonic deadline,
+            // INDEPENDENT of VoiceState. onEndOfSpeech() may have already
+            // flipped the state to TRANSCRIBING — that must not bypass the
+            // retry. Only recoverable errors retry: no-match (7) and
+            // speech-timeout (6). Anything else (audio, client, network,
+            // permissions, busy, server) closes the window immediately.
+            val recoverable = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+            if (isFollowUpWindowOpen() && recoverable) {
                 utterance?.let {
                     it.resultElapsed = System.currentTimeMillis()
                     it.error = reason
                 }
-                val windowOpen = System.currentTimeMillis() < conversationEndsAtMs
-                if (windowOpen && running && conversationRestarts < 8) {
+                if (running && conversationRestarts < 8) {
                     conversationRestarts++
                     logEvent("CONVERSATION — recognizer cycled ($reason), " +
-                        "still listening (restart #$conversationRestarts)")
+                        "window still open (restart #$conversationRestarts)")
                     lastPartialText = ""
                     // Brief beat before re-listening; never a tight loop.
+                    // V1: recheck the DEADLINE (not the state) inside the
+                    // delayed callback — the window may have expired while
+                    // we waited.
                     mainHandler.postDelayed({
-                        if (currentState.get() == VoiceState.CONVERSATION_PAUSE &&
-                            running) {
+                        if (isFollowUpWindowOpen() && running) {
                             startSpeechRecognition()
+                        } else {
+                            logEvent("CONVERSATION — window expired during " +
+                                "retry beat, returning to standby")
+                            closeFollowUpWindow()
                         }
                     }, 500)
                 } else {
-                    logEvent("CONVERSATION — window over after recognizer " +
-                        "error, returning to standby")
-                    conversationEndsAtMs = 0L
-                    finishUtterance(enterConversation = false)
+                    logEvent("CONVERSATION — restart limit hit or stopping, " +
+                        "returning to standby")
+                    closeFollowUpWindow()
                 }
                 return
+            }
+            // Not a recoverable follow-up error (or window already closed):
+            // end the window if one was open, then the normal error path.
+            if (conversationDeadlineElapsed > 0L) {
+                logEvent("CONVERSATION — unrecoverable error ($reason) or " +
+                    "window expired, closing follow-up window")
+                closeFollowUpWindow()
             }
             utterance?.let {
                 it.resultElapsed = System.currentTimeMillis()
@@ -800,12 +936,24 @@ class ListeningForegroundService : Service() {
 
         override fun onResults(results: Bundle?) {
             cancelFailsafe()
-            // M2.5: a follow-up arrived inside the conversation window —
-            // close the window (no wake word was needed) and send it.
-            if (currentState.get() == VoiceState.CONVERSATION_PAUSE) {
+            // V1: a follow-up arrived inside the conversation window —
+            // this is a GENUINELY NEW turn: cancel the old turn, advance
+            // the generation, and start fresh. No wake word was needed.
+            if (isFollowUpWindowOpen()) {
                 cancelConversationTimer()
+                conversationDeadlineElapsed = 0L
                 conversationEndsAtMs = 0L
                 logEvent("CONVERSATION — follow-up captured, sending to relay")
+                cancelActiveTurn("follow-up-turn")
+                conversationGeneration++
+                val turnId = java.util.UUID.randomUUID().toString()
+                activeTurn = Turn(
+                    turnId = turnId,
+                    generation = conversationGeneration,
+                    messageId = null,
+                    startedAtElapsed = SystemClock.elapsedRealtime()
+                )
+                logEvent("TURN START gen=$conversationGeneration id=${turnId.take(8)} (follow-up)")
             }
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             var text = matches?.firstOrNull()?.trim() ?: ""
@@ -971,21 +1119,52 @@ class ListeningForegroundService : Service() {
     /**
      * Display a reply — whichever transport delivered it. Runs on the main
      * thread. The caller MUST have won claimReply() first.
+     *
+     * V1: every reply is bound to the generation that sent its message.
+     * A stale reply (superseded turn) is logged and dropped — it must never
+     * start playback, overwrite the current reply panel, or reopen the
+     * conversation window. Startup recovery passes isRecovery=true: the old
+     * text may be shown, but it never auto-speaks (Req 4).
      */
-    private fun handleIncomingReply(messageId: String, body: String, transport: String) {
+    private fun handleIncomingReply(
+        messageId: String,
+        body: String,
+        transport: String,
+        turnGeneration: Long,
+        isRecovery: Boolean = false
+    ) {
+        // V1: stale-turn guard. A delayed reply from a superseded turn must
+        // not touch the live conversation — not the UI, not the player.
+        if (!isRecovery && turnGeneration != conversationGeneration) {
+            logEvent("STALE REPLY dropped — id=$messageId transport=$transport " +
+                "reply gen=$turnGeneration, current gen=$conversationGeneration")
+            return
+        }
         removePendingMessageId(messageId)
         replyCount++
         latestReply = body
         latestReplyTime = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         latestReplyError = ""
         lastReplyTransport = transport
-        logEvent("REPLY via $transport — displaying (id=$messageId)")
+        logEvent("REPLY via $transport — displaying (id=$messageId gen=$turnGeneration)")
+        if (isRecovery) {
+            // V1 Req 4: a recovered old reply appears as text only — it must
+            // never auto-speak. The wake pipeline was never paused for it.
+            logEvent("RECOVERY — text shown, no audio playback for stale reply")
+            setState(VoiceState.REPLY_RECEIVED)
+            finishUtterance(enterConversation = false)
+            return
+        }
+        // Record reply-arrival latency on the owning turn (if still current).
+        if (turnGeneration == conversationGeneration) {
+            activeTurn?.repliedAtElapsed = SystemClock.elapsedRealtime()
+        }
         setState(VoiceState.REPLY_RECEIVED)
         // M2.3: fetch Vanessa's voice before the conversation pause.
         // finishUtterance(enterConversation=true) is deferred until
         // playback completes (or audio times out) — the wake pipeline
         // stays paused while she speaks.
-        fetchAndPlayAudio(messageId)
+        fetchAndPlayAudio(messageId, turnGeneration)
     }
 
     private val wsListener = object : RelayWebSocket.Listener {
@@ -1000,7 +1179,16 @@ class ListeningForegroundService : Service() {
                     logEvent("WS REPLY duplicate — id=$messageId already handled")
                     return@post
                 }
-                handleIncomingReply(messageId, body, "ws")
+                // V1: bind to the generation that sent this message. If the
+                // mapping is gone (very old), treat as stale — never assign
+                // a delayed reply the CURRENT generation.
+                val gen = generationForMessage(messageId)
+                if (gen == null) {
+                    logEvent("WS REPLY — id=$messageId has no generation mapping, " +
+                        "treating as stale")
+                    return@post
+                }
+                handleIncomingReply(messageId, body, "ws", gen)
             }
         }
 
@@ -1013,8 +1201,35 @@ class ListeningForegroundService : Service() {
         }
 
         override fun onWsStatusEvent(json: JSONObject) {
-            logEvent("WS EVENT — status=${json.optString("status", "?")} " +
-                "id=${json.optString("message_id", "?")}")
+            val status = json.optString("status", "?")
+            val msgId = json.optString("message_id", "?")
+            logEvent("WS EVENT — status=$status id=$msgId")
+            // V1 Req 5/6: per-message status dedup + latency instrumentation.
+            // Duplicate wake_requested events are EXPECTED (the hook fires
+            // repeatedly) — they are status notifications, not new turns, and
+            // must never advance the generation. We count them per message
+            // for the log; single-activation enforcement lives server-side.
+            if (status == "wake_requested") {
+                val n = wakeRequestedCounts.getOrDefault(msgId, 0) + 1
+                wakeRequestedCounts[msgId] = n
+                if (n > 1) {
+                    logEvent("WS EVENT — wake_requested #$n for id=$msgId " +
+                        "(duplicate status, not a new turn)")
+                }
+                return
+            }
+            if (status == "claimed") {
+                // V1 Req 6: record claim time on the owning turn for the
+                // latency breakdown (hint→send→claim→reply→audio→playback).
+                val gen = generationForMessage(msgId)
+                if (gen != null && gen == conversationGeneration) {
+                    activeTurn?.claimedAtElapsed = SystemClock.elapsedRealtime()
+                    logEvent("TURN CLAIMED — id=$msgId gen=$gen")
+                } else {
+                    logEvent("WS EVENT — claimed for id=$msgId " +
+                        "(gen=$gen, current=$conversationGeneration)")
+                }
+            }
         }
 
         override fun onWsConnected(serverReplyCursor: Long) {
@@ -1089,8 +1304,15 @@ class ListeningForegroundService : Service() {
                         claimReply(reply.messageId)) {
                         val id = reply.messageId
                         val body = reply.body
-                        mainHandler.post {
-                            handleIncomingReply(id, body, "ws-catchup")
+                        // V1: bind to the sending generation; drop if unmapped.
+                        val gen = generationForMessage(id)
+                        if (gen == null) {
+                            logEvent("WS CATCH-UP — id=$id has no generation " +
+                                "mapping, skipping")
+                        } else {
+                            mainHandler.post {
+                                handleIncomingReply(id, body, "ws-catchup", gen)
+                            }
                         }
                     }
                 }
@@ -1111,8 +1333,17 @@ class ListeningForegroundService : Service() {
      */
     private fun sendToRelay(transcript: String) {
         val messageId = java.util.UUID.randomUUID().toString()
+        // V1: capture this turn's generation NOW. The poll thread validates
+        // it every iteration — a superseded turn's poll loop exits silently.
+        val sendGeneration = conversationGeneration
+        activeTurn?.let {
+            it.messageId = messageId
+            it.messageSentAtElapsed = SystemClock.elapsedRealtime()
+        }
+        rememberMessageGeneration(messageId, sendGeneration)
         val sendStartMs = System.currentTimeMillis()
-        logEvent("RELAY SENDING — id=$messageId transcript=\"${transcript.take(80)}\"")
+        logEvent("RELAY SENDING — id=$messageId gen=$sendGeneration " +
+            "transcript=\"${transcript.take(80)}\"")
         // Track this message until its reply is displayed — if the user
         // taps Stop mid-poll, startup recovery will pick it up later.
         addPendingMessageId(messageId)
@@ -1156,6 +1387,14 @@ class ListeningForegroundService : Service() {
                     logEvent("RELAY POLL ABORTED — service stopping")
                     return@Thread
                 }
+                // V1: this turn was superseded (new wake / follow-up / Stop).
+                // Exit silently — the new turn owns the conversation now.
+                if (sendGeneration != conversationGeneration) {
+                    logEvent("RELAY POLL — id=$messageId generation superseded " +
+                        "(sent gen=$sendGeneration, current=$conversationGeneration), " +
+                        "stopping poll")
+                    return@Thread
+                }
                 // M2.5: if another transport (WebSocket) already delivered
                 // this reply, the pending entry is gone — stop polling
                 // instead of running to the timeout and clobbering the UI.
@@ -1190,7 +1429,7 @@ class ListeningForegroundService : Service() {
                         logEvent("NATALIE SAYS: \"${match.body.take(200)}\"")
                         val body = match.body
                         mainHandler.post {
-                            handleIncomingReply(messageId, body, "poll")
+                            handleIncomingReply(messageId, body, "poll", sendGeneration)
                         }
                         return@Thread
                     }
@@ -1301,14 +1540,16 @@ class ListeningForegroundService : Service() {
                 "(state=${currentState.get()}); showing reply anyway")
         }
         // M2.5: dedup against the WebSocket / live poll, then use the
-        // single choke point so the reply gets TTS + conversation mode
-        // exactly like the normal flow.
+        // single choke point. V1: recovery replies are text-only, never
+        // auto-speak (isRecovery=true) — the turn they belonged to is long
+        // gone and there is no live turn to bind them to.
         if (!claimReply(reply.messageId)) {
             logEvent("RECOVERY — reply id=${reply.messageId} already handled, skipping")
             return
         }
         logEvent("RECOVERY — displaying missed reply: \"${reply.body.take(200)}\"")
-        handleIncomingReply(reply.messageId, reply.body, "recovery")
+        handleIncomingReply(reply.messageId, reply.body, "recovery",
+            turnGeneration = -1L, isRecovery = true)
     }
 
     // ------------------------------------------------------------------
@@ -1325,17 +1566,20 @@ class ListeningForegroundService : Service() {
     // can never self-trigger a wake. One playback per message ID.
     // ------------------------------------------------------------------
 
-    private fun fetchAndPlayAudio(messageId: String) {
+    private fun fetchAndPlayAudio(messageId: String, turnGeneration: Long) {
         if (wasPlayed(messageId)) {
             logEvent("AUDIO SKIP — id=$messageId already played")
             finishUtterance()
             return
         }
+        // V1: capture the owning turn's generation. Every loop iteration
+        // validates it — a superseded turn's audio fetch exits silently.
+        val audioGeneration = turnGeneration
         audioStatus = "waiting"
         // M2.5: remember which message we're waiting on so a WebSocket
         // audio-ready event can wake this loop immediately.
         audioWaitMessageId = messageId
-        logEvent("AUDIO WAITING — polling for TTS for id=$messageId")
+        logEvent("AUDIO WAITING — polling for TTS for id=$messageId gen=$audioGeneration")
         Thread({
             val deadline = System.currentTimeMillis() + Config.AUDIO_TIMEOUT_MS
             var attempts = 0
@@ -1345,13 +1589,25 @@ class ListeningForegroundService : Service() {
                     audioWaitMessageId = null
                     return@Thread
                 }
+                // V1: superseded turn — stop polling, never play stale audio.
+                if (audioGeneration != conversationGeneration) {
+                    logEvent("AUDIO POLL — id=$messageId generation superseded " +
+                        "(audio gen=$audioGeneration, current=$conversationGeneration), " +
+                        "stopping without playback")
+                    audioWaitMessageId = null
+                    return@Thread
+                }
                 attempts++
                 val res = RelayClient.fetchReplyAudio(messageId)
                 if (res.httpCode == 200 && !res.audioBase64.isNullOrEmpty()) {
                     logEvent("AUDIO RECEIVED — id=$messageId " +
                         "base64Chars=${res.audioBase64.length} attempts=$attempts")
                     audioWaitMessageId = null
-                    mainHandler.post { playReplyAudio(messageId, res.audioBase64) }
+                    // V1: record audio-ready latency on the owning turn.
+                    if (audioGeneration == conversationGeneration) {
+                        activeTurn?.audioReadyAtElapsed = SystemClock.elapsedRealtime()
+                    }
+                    mainHandler.post { playReplyAudio(messageId, res.audioBase64, audioGeneration) }
                     return@Thread
                 }
                 if (res.httpCode != 404 && res.httpCode != 200) {
@@ -1375,6 +1631,13 @@ class ListeningForegroundService : Service() {
                 "${Config.AUDIO_TIMEOUT_MS}ms ($attempts attempts); text reply stands")
             audioWaitMessageId = null
             mainHandler.post {
+                // V1: a superseded turn's timeout must not reopen the
+                // conversation window or touch the reply panel.
+                if (audioGeneration != conversationGeneration) {
+                    logEvent("AUDIO TIMEOUT — id=$messageId turn superseded, " +
+                        "not touching state")
+                    return@post
+                }
                 audioStatus = "no audio — text only"
                 // M2.5: text stands as her turn — still enter conversation
                 // mode so the rhythm holds even without voice.
@@ -1383,8 +1646,21 @@ class ListeningForegroundService : Service() {
         }, "NatalieAudio").start()
     }
 
-    /** Decode + play the MP3. Called on the main thread via mainHandler. */
-    private fun playReplyAudio(messageId: String, audioBase64: String) {
+    /**
+     * Decode + play the MP3. Called on the main thread via mainHandler.
+     *
+     * V1: playback is bound to (turnGeneration, playerIdentity). A stale
+     * turn's audio never starts. The completion/error callbacks capture the
+     * MediaPlayer instance they belong to — a callback from an OLD player
+     * must never stop a NEWER player or touch the new turn's state.
+     */
+    private fun playReplyAudio(messageId: String, audioBase64: String, turnGeneration: Long) {
+        // V1: stale-turn guard — never start playback for a superseded turn.
+        if (turnGeneration != conversationGeneration) {
+            logEvent("AUDIO STALE — id=$messageId not playing " +
+                "(audio gen=$turnGeneration, current=$conversationGeneration)")
+            return
+        }
         // Double-check on the UI thread: never play the same ID twice.
         if (wasPlayed(messageId)) {
             logEvent("AUDIO SKIP (race) — id=$messageId already played")
@@ -1400,18 +1676,36 @@ class ListeningForegroundService : Service() {
             releasePlayer()
             val mp = MediaPlayer()
             mediaPlayer = mp
+            // V1: player identity — callbacks below act only if THIS player
+            // is still the current one.
             mp.setDataSource(file.absolutePath)
             mp.setOnCompletionListener {
+                // V1: an old player's completion must never finish a newer
+                // turn's utterance or reopen its conversation window.
+                if (mediaPlayer !== it || turnGeneration != conversationGeneration) {
+                    logEvent("AUDIO COMPLETED (stale player/turn) — id=$messageId " +
+                        "ignoring callback")
+                    try { it.release() } catch (_: Exception) {}
+                    return@setOnCompletionListener
+                }
                 logEvent("AUDIO COMPLETED — id=$messageId playback finished")
                 markPlayed(messageId)
                 audioStatus = ""
                 releasePlayer()
                 try { file.delete() } catch (_: Exception) {}
+                // Latency summary for this turn (Req 6).
+                activeTurn?.let { logEvent("TURN LATENCY — ${it.latencySummary()}") }
                 // M2.5: she finished speaking — open the conversation
                 // window for a follow-up instead of going to standby.
                 finishUtterance(enterConversation = true)
             }
-            mp.setOnErrorListener { _, what, extra ->
+            mp.setOnErrorListener { errPlayer, what, extra ->
+                if (mediaPlayer !== errPlayer || turnGeneration != conversationGeneration) {
+                    logEvent("AUDIO PLAYBACK FAILED (stale player/turn) — " +
+                        "id=$messageId ignoring callback")
+                    try { errPlayer.release() } catch (_: Exception) {}
+                    return@setOnErrorListener true
+                }
                 logEvent("AUDIO PLAYBACK FAILED — id=$messageId what=$what extra=$extra")
                 markPlayed(messageId)
                 audioStatus = "playback error"
@@ -1426,6 +1720,9 @@ class ListeningForegroundService : Service() {
             // SPEAKING is real: playback actually started.
             markPlayed(messageId)
             audioStatus = "playing"
+            if (turnGeneration == conversationGeneration) {
+                activeTurn?.playbackStartedAtElapsed = SystemClock.elapsedRealtime()
+            }
             setState(VoiceState.SPEAKING)
             logEvent("AUDIO SPEAKING — id=$messageId playing ${bytes.size} bytes MP3")
             mp.start()
@@ -1445,7 +1742,15 @@ class ListeningForegroundService : Service() {
     }
     private fun armFailsafe() {
         cancelFailsafe()
+        // V1: capture the generation — a stale failsafe must never cancel a
+        // newer turn's recognizer.
+        val failsafeGeneration = conversationGeneration
         val r = Runnable {
+            if (failsafeGeneration != conversationGeneration) {
+                logEvent("STT FAILSAFE — stale (gen=$failsafeGeneration, " +
+                    "current=$conversationGeneration), ignoring")
+                return@Runnable
+            }
             if (currentState.get() == VoiceState.CAPTURING ||
                 currentState.get() == VoiceState.TRANSCRIBING) {
                 logEvent("STT FAILSAFE — no result/error within " +
@@ -1468,6 +1773,20 @@ class ListeningForegroundService : Service() {
     private fun cancelConversationTimer() {
         conversationTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         conversationTimeoutRunnable = null
+    }
+
+    /**
+     * V1: close the follow-up window without disturbing anything else.
+     * Cancels the recognizer, clears the deadline, and returns to standby.
+     * Never advances the generation — closing a window is not a new turn.
+     */
+    private fun closeFollowUpWindow() {
+        cancelConversationTimer()
+        conversationDeadlineElapsed = 0L
+        conversationEndsAtMs = 0L
+        try { speechRecognizer?.cancel() } catch (_: Exception) {}
+        logEvent("CONVERSATION — follow-up window closed, returning to standby")
+        finishUtterance(enterConversation = false)
     }
 
     // ------------------------------------------------------------------
@@ -1494,6 +1813,11 @@ class ListeningForegroundService : Service() {
             return
         }
         setState(VoiceState.CONVERSATION_PAUSE)
+        // V1: the follow-up window is a MONOTONIC deadline, independent of
+        // VoiceState. onEndOfSpeech()/onError() can flip states around, but
+        // only this deadline decides whether the window is still open.
+        val nowElapsed = SystemClock.elapsedRealtime()
+        conversationDeadlineElapsed = nowElapsed + Config.CONVERSATION_WINDOW_MS
         conversationEndsAtMs =
             System.currentTimeMillis() + Config.CONVERSATION_WINDOW_MS
         conversationRestarts = 0
@@ -1506,12 +1830,18 @@ class ListeningForegroundService : Service() {
         }
         lastPartialText = ""
         cancelConversationTimer()
+        // V1: capture this window's generation — a stale timer must never
+        // close a NEWER turn's follow-up window.
+        val windowGeneration = conversationGeneration
         val timeout = Runnable {
-            if (currentState.get() == VoiceState.CONVERSATION_PAUSE) {
+            if (windowGeneration != conversationGeneration) {
+                logEvent("CONVERSATION — stale timeout (gen=$windowGeneration, " +
+                    "current=$conversationGeneration), ignoring")
+                return@Runnable
+            }
+            if (isFollowUpWindowOpen()) {
                 logEvent("CONVERSATION — no follow-up, returning to standby")
-                try { speechRecognizer?.cancel() } catch (_: Exception) {}
-                conversationEndsAtMs = 0L
-                finishUtterance(enterConversation = false)
+                closeFollowUpWindow()
             }
         }
         conversationTimeoutRunnable = timeout
