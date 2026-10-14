@@ -14,3 +14,6 @@ local.properties
 
 # OS
 .DS_Store
+
+# Local secrets — never commit
+app/src/main/java/com/natalie/assistant/RelaySecrets.kt
